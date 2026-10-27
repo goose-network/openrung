@@ -277,3 +277,30 @@ func NewHTTPClientWithDialControl(
 		CheckRedirect: refuseRedirect,
 	}
 }
+
+// NewHTTPClientWithBaseDialer is NewHTTPClient over a caller-supplied base
+// dialer: every raw socket beneath the front's TLS — the ECH, no-SNI, and
+// plain-TLS dials alike — is established by dial instead of the platform
+// dialer. Embedders use this to route the broker fetch through their own
+// network stack (the goose engine threads its layer-2/3/4 stack dialer in
+// here): the ECH and no-SNI ClientHello protection is unchanged on the wire,
+// since dial replaces only the socket underneath. The returned client shares
+// the package's authenticated ECH retry-config state and owns its own
+// connection pool. The base keeps http.DefaultTransport's timeouts, so the
+// TLS handshake limit applies on top of dial's connection establishment. A
+// nil dial returns NewHTTPClient.
+func NewHTTPClientWithBaseDialer(
+	timeout time.Duration,
+	dial func(ctx context.Context, network, address string) (net.Conn, error),
+) *http.Client {
+	if dial == nil {
+		return NewHTTPClient(timeout)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DialContext = dial
+	return &http.Client{
+		Transport:     newTransport(base, defaultECHState, brokerECHTimeout),
+		Timeout:       timeout,
+		CheckRedirect: refuseRedirect,
+	}
+}

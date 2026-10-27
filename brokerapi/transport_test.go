@@ -725,3 +725,61 @@ func TestNewHTTPClientWithDialControlRunsOnEverySocket(t *testing.T) {
 		t.Fatal("a failing dial control must fail the request, not fall back to an unprotected socket")
 	}
 }
+
+// The base-dialer client is the embedder's routing seam: the goose engine
+// threads its layer-2/3/4 stack dialer through it so the broker fetch's
+// sockets ride the engine's stack. Every underlying socket must come from the
+// supplied dialer, the fronting dial machinery (ECH, no-SNI) must stay
+// wrapped around it — the transport is the package's fronting transport, not
+// a plain http.Transport — and a dial error must fail the request rather than
+// fall back to the platform dialer.
+func TestNewHTTPClientWithBaseDialerSwapsEverySocket(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_, _ = io.ReadAll(io.LimitReader(conn, 1))
+			_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	var dialed atomic.Int32
+	client := NewHTTPClientWithBaseDialer(5*time.Second, func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialed.Add(1)
+		var d net.Dialer
+		return d.DialContext(ctx, network, listener.Addr().String())
+	})
+	response, err := client.Get("http://" + listener.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("GET through the base dialer: %v", err)
+	}
+	_ = response.Body.Close()
+	if dialed.Load() == 0 {
+		t.Fatal("the request never dialed through the supplied base dialer")
+	}
+	if _, plain := client.Transport.(*http.Transport); plain {
+		t.Fatal("transport is a plain http.Transport: the ECH/no-SNI fronting was dropped")
+	}
+	if _, fronting := client.Transport.(*azureModeTransport); !fronting {
+		t.Fatalf("transport = %T, want the package's fronting transport", client.Transport)
+	}
+
+	refused := NewHTTPClientWithBaseDialer(5*time.Second, func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, errors.New("stack dialer refused")
+	})
+	if _, err := refused.Get("http://" + listener.Addr().String() + "/"); err == nil {
+		t.Fatal("a failing base dialer must fail the request, not fall back to the platform dialer")
+	}
+
+	if NewHTTPClientWithBaseDialer(5*time.Second, nil).Transport != NewHTTPClient(5*time.Second).Transport {
+		t.Fatal("nil dial must return the default shared-transport client")
+	}
+}
